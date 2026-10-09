@@ -1,3 +1,13 @@
+## 0.7.5 (2026-10-09)
+
+* Confirm arm/disarm commands actually reach the panel: after the portal accepts a command, wait up to 120 s for Pulse to report the requested state, retry once, then fire an `adtpulse_command_failed` event (`action`, `attempts`, `last_status`) instead of silently reverting
+* Confirmation/retry runs in the background so service calls return immediately and don't stall automations
+* A command the portal rejects outright also fires `adtpulse_command_failed`
+
+## 0.7.4 (2026-10-08)
+
+* Fix arming, zone-listener and reload issues (see commit 2696c2a)
+
 ## 0.7.3 (2026-03-21)
 
 * Fix missing `code` parameter in `async_alarm_arm_night` causing crash when arming to Night mode on HA 2025.8+

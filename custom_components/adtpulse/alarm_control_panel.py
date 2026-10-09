@@ -3,7 +3,8 @@
 import asyncio
 import logging
 from datetime import datetime
-from collections.abc import Coroutine
+from functools import partial
+from collections.abc import Callable, Coroutine
 
 from pyadtpulse.site import ADTPulseSite
 from homeassistant.core import HomeAssistant, callback
@@ -62,6 +63,12 @@ _ARMED_STATES = {
     AlarmControlPanelState.ARMED_CUSTOM_BYPASS,
 }
 
+# after the portal accepts a command, how long to wait for the panel to
+# actually reach the requested state before retrying / giving up
+ALARM_CONFIRM_TIMEOUT = 120  # seconds
+ALARM_COMMAND_ATTEMPTS = 2  # first try + one retry
+EVENT_COMMAND_FAILED = "adtpulse_command_failed"
+
 FORCE_ARM = "force arm"
 ARM_ERROR_MESSAGE = (
     f"Pulse system cannot be armed due to opened/tripped zone - use {FORCE_ARM}"
@@ -112,6 +119,10 @@ class ADTPulseAlarm(ADTPulseEntity, AlarmControlPanelEntity):
         self._name = f"ADT Alarm Panel - Site {site.id}"
         self._assumed_state: AlarmControlPanelState | None = None
         self._requested_action: AlarmControlPanelState | None = None
+        # confirmation of the panel actually acting on a command
+        self._confirm_target: AlarmControlPanelState | None = None
+        self._confirm_event = asyncio.Event()
+        self._confirm_task: asyncio.Task | None = None
         super().__init__(coordinator, ALARM_CONTEXT)
 
     @property
@@ -159,25 +170,92 @@ class ADTPulseAlarm(ADTPulseEntity, AlarmControlPanelEntity):
             info["via_device_id"] = via_device_id
         return info
 
+    @staticmethod
+    def _confirm_state_for(
+        action: AlarmControlPanelState,
+    ) -> AlarmControlPanelState:
+        """Real (mapped) Pulse state that proves the panel acted on a command.
+
+        Force away (custom bypass) shows up as armed away in Pulse; force stay
+        is requested as armed_home already.
+        """
+        if action == AlarmControlPanelState.ARMED_CUSTOM_BYPASS:
+            return AlarmControlPanelState.ARMED_AWAY
+        return action
+
+    @staticmethod
+    def _action_name(action: AlarmControlPanelState, force_arm: bool) -> str:
+        """Human readable command name for logs, errors and notifications."""
+        names = {
+            AlarmControlPanelState.DISARMED: "disarm",
+            AlarmControlPanelState.ARMED_HOME: "arm stay",
+            AlarmControlPanelState.ARMED_AWAY: "arm away",
+            AlarmControlPanelState.ARMED_NIGHT: "arm night",
+            AlarmControlPanelState.ARMED_CUSTOM_BYPASS: "arm away",
+        }
+        name = names.get(action, str(action))
+        return f"force {name}" if force_arm else name
+
+    def _real_alarm_state(self) -> str:
+        status = self._alarm.status
+        mapped = ALARM_MAP.get(status)
+        return str(mapped) if mapped is not None else str(status)
+
     async def _perform_alarm_action(
         self,
-        arm_disarm_func: Coroutine[bool | None, None, bool],
+        arm_disarm_func: Callable[[], Coroutine[bool | None, None, bool]],
         action: AlarmControlPanelState,
         force_arm: bool = False,
     ) -> None:
-        result = True
+        """Send an arm/disarm command.
+
+        arm_disarm_func is a factory (site method + args) so the command can be
+        re-sent; each call creates a fresh coroutine.  The service call returns
+        as soon as the portal accepts the command; confirming that the panel
+        actually acted on it (and retrying once) runs in the background so a
+        slow/failed panel never stalls automations.
+        """
         logger.debug("%s: Setting Alarm to %s", ADTPULSE_DOMAIN, action)
+        coro = arm_disarm_func()
         if action != AlarmControlPanelState.DISARMED:
             try:
                 # force arm bypasses open zones, so skip the "can be armed" check
                 await self._check_if_system_armable(FORCE_ARM if force_arm else action)
             except Exception:
-                arm_disarm_func.close()  # don't leak the never-awaited coroutine
+                coro.close()  # don't leak the never-awaited coroutine
                 raise
         if self.alarm_state == action:
-            arm_disarm_func.close()  # don't leak the never-awaited coroutine
+            coro.close()  # don't leak the never-awaited coroutine
             logger.warning("Attempting to set alarm to same state, ignoring")
             return
+        self._cancel_confirm_task()
+        name = self._action_name(action, force_arm)
+        result = await self._send_alarm_command(coro, action)
+        if not result:
+            logger.warning("Could not %s ADT Pulse alarm", action)
+            self._fire_command_failed(name, 1)
+            raise HomeAssistantError(f"Could not set alarm status to {action}")
+        self._confirm_target = self._confirm_state_for(action)
+        self._confirm_event.clear()
+        task_name = f"{ADTPULSE_DOMAIN} confirm {name}"
+        target = self._confirm_alarm_action(arm_disarm_func, action, name)
+        if self.coordinator.config_entry is not None:
+            self._confirm_task = (
+                self.coordinator.config_entry.async_create_background_task(
+                    self.hass, target, task_name
+                )
+            )
+        else:
+            self._confirm_task = self.hass.async_create_background_task(
+                target, task_name
+            )
+
+    async def _send_alarm_command(
+        self,
+        coro: Coroutine[bool | None, None, bool],
+        action: AlarmControlPanelState,
+    ) -> bool:
+        """Post one arm/disarm command to the portal, holding the assumed state."""
         if not self._gateway.is_online:
             self._assumed_state = action
         elif action == AlarmControlPanelState.DISARMED:
@@ -189,7 +267,7 @@ class ADTPulseAlarm(ADTPulseEntity, AlarmControlPanelEntity):
         result = False
         try:
             async with asyncio.timeout(ALARM_ACTION_TIMEOUT):
-                result = await arm_disarm_func
+                result = await coro
         except TimeoutError:
             logger.warning(
                 "%s: timed out after %d seconds waiting to %s ADT Pulse alarm",
@@ -200,9 +278,127 @@ class ADTPulseAlarm(ADTPulseEntity, AlarmControlPanelEntity):
         finally:
             # always clear, even on error/timeout/cancel, so state can't stick
             self._clear_assumed_state()
-        if not result:
-            logger.warning("Could not %s ADT Pulse alarm", action)
-            raise HomeAssistantError(f"Could not set alarm status to {action}")
+        return bool(result)
+
+    def _confirm_target_reached(self) -> bool:
+        return (
+            self._confirm_target is not None
+            and ALARM_MAP.get(self._alarm.status) == self._confirm_target
+        )
+
+    async def _wait_for_confirmation(self, timeout: float) -> bool:
+        """Wait until Pulse reports the requested real state, or time out."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            if self._confirm_target_reached():
+                return True
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            self._confirm_event.clear()
+            # event is set from _handle_coordinator_update; the short cap is a
+            # belt-and-braces re-check in case an update is missed
+            try:
+                async with asyncio.timeout(min(remaining, 10)):
+                    await self._confirm_event.wait()
+            except TimeoutError:
+                pass
+
+    async def _confirm_alarm_action(
+        self,
+        arm_disarm_func: Callable[[], Coroutine[bool | None, None, bool]],
+        action: AlarmControlPanelState,
+        name: str,
+    ) -> None:
+        """Confirm the panel acted on a command; retry once, then report."""
+        attempts = 1
+        try:
+            if await self._wait_for_confirmation(ALARM_CONFIRM_TIMEOUT):
+                logger.debug("%s: panel confirmed %s", ADTPULSE_DOMAIN, name)
+                return
+            while attempts < ALARM_COMMAND_ATTEMPTS:
+                attempts += 1
+                if (
+                    action != AlarmControlPanelState.DISARMED
+                    and ALARM_MAP.get(self._alarm.status)
+                    != AlarmControlPanelState.DISARMED
+                ):
+                    # panel moved to some other state; Pulse can't arm from it
+                    logger.warning(
+                        "%s: panel did not confirm %s and is now %s; not retrying",
+                        ADTPULSE_DOMAIN,
+                        name,
+                        self._real_alarm_state(),
+                    )
+                    break
+                logger.warning(
+                    "%s: panel did not confirm %s within %d s (status %s); "
+                    "retrying (attempt %d)",
+                    ADTPULSE_DOMAIN,
+                    name,
+                    ALARM_CONFIRM_TIMEOUT,
+                    self._real_alarm_state(),
+                    attempts,
+                )
+                try:
+                    result = await self._send_alarm_command(arm_disarm_func(), action)
+                except Exception:  # noqa: BLE001
+                    logger.exception("%s: retry of %s failed", ADTPULSE_DOMAIN, name)
+                    result = False
+                if result and await self._wait_for_confirmation(
+                    ALARM_CONFIRM_TIMEOUT
+                ):
+                    logger.info(
+                        "%s: panel confirmed %s after retry", ADTPULSE_DOMAIN, name
+                    )
+                    return
+            self._clear_assumed_state()
+            logger.error(
+                "ADT Pulse did not confirm %s (panel communication failure) "
+                "after %d attempt(s); status %s",
+                name,
+                attempts,
+                self._real_alarm_state(),
+            )
+            self._fire_command_failed(name, attempts)
+        except asyncio.CancelledError:
+            logger.debug("%s: confirmation of %s cancelled", ADTPULSE_DOMAIN, name)
+            raise
+        finally:
+            if asyncio.current_task() is self._confirm_task:
+                self._confirm_task = None
+                self._confirm_target = None
+
+    @callback
+    def _fire_command_failed(self, name: str, attempts: int) -> None:
+        if self.hass is None:
+            return
+        self.hass.bus.async_fire(
+            EVENT_COMMAND_FAILED,
+            {
+                "entity_id": self.entity_id,
+                "action": name,
+                "attempts": attempts,
+                "last_status": self._real_alarm_state(),
+                "message": (
+                    f"ADT Pulse did not confirm {name} "
+                    "(panel communication failure)"
+                ),
+            },
+        )
+
+    @callback
+    def _cancel_confirm_task(self) -> None:
+        if self._confirm_task is not None and not self._confirm_task.done():
+            self._confirm_task.cancel()
+        self._confirm_task = None
+        self._confirm_target = None
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Stop any pending confirmation when the entity goes away."""
+        self._cancel_confirm_task()
+        await super().async_will_remove_from_hass()
 
     @callback
     def _clear_assumed_state(self) -> None:
@@ -227,7 +423,7 @@ class ADTPulseAlarm(ADTPulseEntity, AlarmControlPanelEntity):
     async def async_alarm_disarm(self, code: str | None = None) -> None:
         """Send disarm command."""
         await self._perform_alarm_action(
-            arm_disarm_func=self._site.async_disarm(),
+            arm_disarm_func=self._site.async_disarm,
             action=AlarmControlPanelState.DISARMED,
         )
 
@@ -244,14 +440,14 @@ class ADTPulseAlarm(ADTPulseEntity, AlarmControlPanelEntity):
     async def async_alarm_arm_home(self, code: str | None = None) -> None:
         """Send arm home command."""
         await self._perform_alarm_action(
-            arm_disarm_func=self._site.async_arm_home(),
+            arm_disarm_func=self._site.async_arm_home,
             action=AlarmControlPanelState.ARMED_HOME,
         )
 
     async def async_alarm_arm_away(self, code: str | None = None) -> None:
         """Send arm away command."""
         await self._perform_alarm_action(
-            arm_disarm_func=self._site.async_arm_away(),
+            arm_disarm_func=self._site.async_arm_away,
             action=AlarmControlPanelState.ARMED_AWAY,
         )
 
@@ -259,7 +455,7 @@ class ADTPulseAlarm(ADTPulseEntity, AlarmControlPanelEntity):
     async def async_alarm_arm_custom_bypass(self, code: str | None = None) -> None:
         """Send force arm command."""
         await self._perform_alarm_action(
-            arm_disarm_func=self._site.async_arm_away(force_arm=True),
+            arm_disarm_func=partial(self._site.async_arm_away, force_arm=True),
             action=AlarmControlPanelState.ARMED_CUSTOM_BYPASS,
             force_arm=True,
         )
@@ -267,7 +463,7 @@ class ADTPulseAlarm(ADTPulseEntity, AlarmControlPanelEntity):
     async def async_alarm_arm_night(self, code: str | None = None) -> None:
         """Send arm night command."""
         await self._perform_alarm_action(
-            arm_disarm_func=self._site.async_arm_night(),
+            arm_disarm_func=self._site.async_arm_night,
             action=AlarmControlPanelState.ARMED_NIGHT,
         )
 
@@ -278,7 +474,7 @@ class ADTPulseAlarm(ADTPulseEntity, AlarmControlPanelEntity):
         use as a service call.
         """
         await self._perform_alarm_action(
-            arm_disarm_func=self._site.async_arm_home(force_arm=True),
+            arm_disarm_func=partial(self._site.async_arm_home, force_arm=True),
             action=AlarmControlPanelState.ARMED_HOME,
             force_arm=True,
         )
@@ -333,4 +529,6 @@ class ADTPulseAlarm(ADTPulseEntity, AlarmControlPanelEntity):
                          ADTPULSE_DOMAIN)
             self._assumed_state = None
             self._requested_action = None
+        if self._confirm_target_reached():
+            self._confirm_event.set()
         self.async_write_ha_state()
