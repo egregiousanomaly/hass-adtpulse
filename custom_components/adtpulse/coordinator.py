@@ -2,7 +2,7 @@
 
 import logging
 from typing import Any
-from asyncio import Task, CancelledError
+from asyncio import Task, CancelledError, sleep
 from collections.abc import Callable
 
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
@@ -25,6 +25,10 @@ ZONE_CONTEXT_PREFIX = "Zone "
 ZONE_TROUBLE_PREFIX = " Trouble"
 CONNECTION_STATUS_CONTEXT = "ConnectionStatus"
 NEXT_REFRESH_CONTEXT = "NextRefresh"
+
+# self-healing: reload the entry instead of letting the update loop die
+RECONNECT_DELAYS = (60, 300, 900, 1800)  # seconds, last one repeats
+LOGIN_RETRIES_BEFORE_REAUTH = 3
 
 
 class ADTPulseDataUpdateCoordinator(DataUpdateCoordinator):
@@ -59,7 +63,26 @@ class ADTPulseDataUpdateCoordinator(DataUpdateCoordinator):
     ) -> Callable[[], None]:
         """Listen for data updates."""
         self._listener_dictionary[context] = update_callback
-        return super().async_add_listener(update_callback, context)
+        remove_listener = super().async_add_listener(update_callback, context)
+
+        @callback
+        def remove_and_forget() -> None:
+            # drop the context too, so a removed/disabled entity isn't called later
+            if self._listener_dictionary.get(context) is update_callback:
+                del self._listener_dictionary[context]
+            remove_listener()
+
+        return remove_and_forget
+
+    @callback
+    def _call_listener(self, context: str) -> None:
+        """Call the listener for context, if one is registered.
+
+        Disabled or not-yet-added entities have no listener; skip them instead of
+        raising KeyError (which used to kill the update task).
+        """
+        if (update_callback := self._listener_dictionary.get(context)) is not None:
+            update_callback()
 
     @callback
     def async_update_listeners(self) -> None:
@@ -75,14 +98,12 @@ class ADTPulseDataUpdateCoordinator(DataUpdateCoordinator):
             return
         data_to_update: tuple[bool, set[int]] = self.data
         if data_to_update[0]:
-            self._listener_dictionary[ALARM_CONTEXT]()
+            self._call_listener(ALARM_CONTEXT)
         for zones in data_to_update[1]:
-            self._listener_dictionary[ZONE_CONTEXT_PREFIX + str(zones)]()
-            self._listener_dictionary[
-                ZONE_CONTEXT_PREFIX + str(zones) + ZONE_TROUBLE_PREFIX
-            ]()
+            self._call_listener(ZONE_CONTEXT_PREFIX + str(zones))
+            self._call_listener(ZONE_CONTEXT_PREFIX + str(zones) + ZONE_TROUBLE_PREFIX)
         for i in CONNECTION_STATUS_CONTEXT, NEXT_REFRESH_CONTEXT:
-            self._listener_dictionary[i]()
+            self._call_listener(i)
         logger.debug(
             "%s: partial async_update_listeners took %s",
             ADTPULSE_DOMAIN,
@@ -106,10 +127,47 @@ class ADTPulseDataUpdateCoordinator(DataUpdateCoordinator):
     async def stop(self):
         """Stop ADT Pulse update coordinator."""
         if self._update_task:
-            if not self._update_task.cancelled():
+            if not self._update_task.done():
                 self._update_task.cancel()
-            await self._update_task
+            try:
+                await self._update_task
+            except CancelledError:
+                pass
+            except Exception:  # noqa: BLE001
+                # a crashed update task must not make the entry fail to unload
+                logger.exception("%s: update task had failed", ADTPULSE_DOMAIN)
             self._update_task = None
+
+    def _failure_count(self) -> int:
+        return self.hass.data.setdefault(ADTPULSE_DOMAIN + "_reconnect", {}).get(
+            self.config_entry.entry_id if self.config_entry else "", 0
+        )
+
+    def _set_failure_count(self, count: int) -> None:
+        if self.config_entry:
+            self.hass.data.setdefault(ADTPULSE_DOMAIN + "_reconnect", {})[
+                self.config_entry.entry_id
+            ] = count
+
+    async def _reconnect_later(self, reason: str) -> None:
+        """Wait with back-off, then reload the config entry to reconnect."""
+        failures = self._failure_count()
+        delay = RECONNECT_DELAYS[min(failures, len(RECONNECT_DELAYS) - 1)]
+        self._set_failure_count(failures + 1)
+        logger.warning(
+            "%s: %s; reconnecting in %d seconds (attempt %d)",
+            ADTPULSE_DOMAIN,
+            reason,
+            delay,
+            failures + 1,
+        )
+        try:
+            await sleep(delay)
+        except CancelledError:
+            # unload/stop while waiting: exit quietly like the main loop does
+            return
+        if self.config_entry and not self.hass.is_stopping:
+            self.hass.config_entries.async_schedule_reload(self.config_entry.entry_id)
 
     async def _async_update_data(self) -> None:
         """Fetch data from ADT Pulse."""
@@ -125,7 +183,11 @@ class ADTPulseDataUpdateCoordinator(DataUpdateCoordinator):
                     ADTPULSE_DOMAIN,
                     ex,
                 )
-                if self.config_entry:
+                # ADT's login endpoint fails transiently; only ask for
+                # re-auth after repeated failures
+                if self._failure_count() < LOGIN_RETRIES_BEFORE_REAUTH:
+                    await self._reconnect_later(f"login failed ({ex})")
+                elif self.config_entry:
                     self.config_entry.async_start_reauth(self.hass)
                 return
             except PulseExceptionWithRetry as ex:
@@ -147,23 +209,30 @@ class ADTPulseDataUpdateCoordinator(DataUpdateCoordinator):
                 logger.debug("%s: coordinator received cancellation", ADTPULSE_DOMAIN)
                 return
             except Exception as ex:
-                logger.error(
-                    "%s: coordinator received unknown exception %s, exiting...",
-                    ADTPULSE_DOMAIN,
-                    ex,
+                logger.exception(
+                    "%s: coordinator received unknown exception %s", ADTPULSE_DOMAIN, ex
                 )
-                raise
+                await self._reconnect_later(f"update loop crashed ({ex!r})")
+                return
             finally:
-                if update_exception:
-                    self.async_set_update_error(update_exception)
-                    # async_set_update_error will only notify listeners on first error
-                    # it also doesn't reset data
-                    self.data = None
-                    if not self.last_update_success:
-                        self.async_update_listeners()
-                else:
-                    self.last_exception = None
-                    self.async_set_updated_data(data)
+                # exceptions raised here would bypass the handlers above and
+                # silently end the update loop, so contain them
+                try:
+                    if update_exception:
+                        self.async_set_update_error(update_exception)
+                        # async_set_update_error will only notify listeners on first
+                        # error; it also doesn't reset data
+                        self.data = None
+                        if not self.last_update_success:
+                            self.async_update_listeners()
+                    elif data is not None:
+                        self.last_exception = None
+                        self._set_failure_count(0)
+                        self.async_set_updated_data(data)
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "%s: error notifying listeners of update", ADTPULSE_DOMAIN
+                    )
 
             logger.debug(
                 "%s: coordinator received update notification", ADTPULSE_DOMAIN

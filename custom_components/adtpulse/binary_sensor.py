@@ -29,6 +29,7 @@ from .utils import (
     zone_is_in_trouble,
     migrate_entity_name,
     get_gateway_unique_id,
+    get_gateway_device_id,
 )
 from .base_entity import ADTPulseEntity
 from .coordinator import (
@@ -246,12 +247,20 @@ class ADTPulseZoneSensor(ADTPulseEntity, BinarySensorEntity):
     @property
     def device_info(self) -> DeviceInfo:
         """Return device info."""
-        return DeviceInfo(
+        info = DeviceInfo(
             identifiers={(ADTPULSE_DOMAIN, f"{self._site.id}-{self._my_zone.name}")},
-            via_device=(ADTPULSE_DOMAIN, get_gateway_unique_id(self._site)),
             name=self._my_zone.name,
             manufacturer="ADT",
         )
+        if via_device_id := get_gateway_device_id(
+            self.hass,
+            self._site,
+            self.coordinator.config_entry.entry_id
+            if self.coordinator.config_entry
+            else None,
+        ):
+            info["via_device_id"] = via_device_id
+        return info
 
     @callback
     def _handle_coordinator_update(self) -> None:

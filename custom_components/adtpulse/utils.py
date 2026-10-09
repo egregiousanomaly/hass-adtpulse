@@ -5,7 +5,7 @@ from pyadtpulse.const import STATE_OK, STATE_ONLINE
 from pyadtpulse.zones import ADTPulseZoneData
 from homeassistant.core import HomeAssistant
 from homeassistant.util import slugify
-from homeassistant.helpers import entity_registry
+from homeassistant.helpers import entity_registry, device_registry
 
 from .const import ADTPULSE_DOMAIN
 
@@ -45,6 +45,22 @@ def migrate_entity_name(
 def get_gateway_unique_id(site: ADTPulseSite) -> str:
     """Get entity unique id for the gateway."""
     return f"adt_pulse_gateway_{site.id}"
+
+
+def get_gateway_device_id(
+    hass: HomeAssistant, site: ADTPulseSite, config_entry_id: str | None
+) -> str | None:
+    """Get the device registry id of the gateway, for use as via_device_id.
+
+    `via_device` (an identifier tuple) is deprecated in HA 2026.9 and removed in
+    2027.8; device_info must now reference the parent by device registry id.
+    """
+    if config_entry_id is None:
+        return None
+    device = device_registry.async_get(hass).async_get_device_by_identifier(
+        (ADTPULSE_DOMAIN, get_gateway_unique_id(site)), config_entry_id
+    )
+    return device.id if device else None
 
 
 def get_alarm_unique_id(site: ADTPulseSite) -> str:

@@ -6,12 +6,12 @@
     ],
     "config_flow": true,
     "dependencies": [],
-    "documentation": "https://github.com/EVWorth/hass-adtpulse/",
+    "documentation": "https://github.com/egregiousanomaly/hass-adtpulse/",
     "integration_type": "hub",
     "iot_class": "cloud_push",
-    "issue_tracker": "https://github.com/EVWorth/hass-adtpulse/issues",
+    "issue_tracker": "https://github.com/egregiousanomaly/hass-adtpulse/issues",
     "requirements": [
         "pyadtpulse>=1.2.14"
     ],
-    "version": "0.7.3"
+    "version": "0.7.4"
 }

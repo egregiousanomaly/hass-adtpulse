@@ -23,12 +23,14 @@ from homeassistant.const import (
 from pyadtpulse.exceptions import (
     PulseAccountLockedError,
     PulseAuthenticationError,
+    PulseConnectionError,
     PulseGatewayOfflineError,
     PulseServiceTemporarilyUnavailableError,
 )
 from homeassistant.exceptions import ConfigEntryNotReady, ConfigEntryAuthFailed
 from pyadtpulse.pyadtpulse_async import PyADTPulseAsync
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.helpers import device_registry
 from homeassistant.helpers.typing import ConfigType
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.config_validation import config_entry_only_config_schema
@@ -40,6 +42,7 @@ from .const import (
     CONF_RELOGIN_INTERVAL,
     CONF_KEEPALIVE_INTERVAL,
 )
+from .utils import get_gateway_unique_id
 from .coordinator import ADTPulseDataUpdateCoordinator
 
 logger = logging.getLogger(__name__)
@@ -121,6 +124,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         PulseAccountLockedError,
         PulseServiceTemporarilyUnavailableError,
         PulseGatewayOfflineError,
+        # network errors during login (issue #15): let HA retry setup
+        PulseConnectionError,
     ) as ex:
         logger.error("Unable to connect to ADT Pulse: %s", ex)
         raise ConfigEntryNotReady(
@@ -138,6 +143,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             poll_interval,
             ex,
         )
+    # register the gateway device up front so child devices can reference it by
+    # device id (via_device_id) regardless of platform setup order
+    device_registry.async_get(hass).async_get_or_create(
+        config_entry_id=entry.entry_id,
+        identifiers={(ADTPULSE_DOMAIN, get_gateway_unique_id(service.site))},
+    )
     coordinator = ADTPulseDataUpdateCoordinator(hass, service)
     hass.data.setdefault(ADTPULSE_DOMAIN, {})
     hass.data[ADTPULSE_DOMAIN][entry.entry_id] = coordinator
