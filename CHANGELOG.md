@@ -1,3 +1,10 @@
+## 0.7.6 (2026-10-26)
+
+* Detect a dead or stale Pulse session. pyadtpulse's `wait_for_update()` only returns on data changes or errors, so a session that was silently logged out (2026-10-14..25) left the connection-status sensor at "Connection OK" for days. The update loop now wakes every 60 s and checks the session:
+  * not authenticated (`is_connected` false) for 3+ min -> status "Not Logged In"
+  * keepalive or sync-check task no longer running, or no relogin for 2 x relogin interval + 1 keepalive interval (125 min with 60/5) -> new status "Connection Stale"
+  * clears itself back to "Connection OK" when the session is healthy again; never overrides a more specific error reported by pyadtpulse
+
 ## 0.7.5 (2026-10-09)
 
 * Confirm arm/disarm commands actually reach the panel: after the portal accepts a command, wait up to 120 s for Pulse to report the requested state, retry once, then fire an `adtpulse_command_failed` event (`action`, `attempts`, `last_status`) instead of silently reverting

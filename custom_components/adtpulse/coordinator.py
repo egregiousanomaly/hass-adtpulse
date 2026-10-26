@@ -1,5 +1,7 @@
 """ADT Pulse Update Coordinator."""
 
+import time
+import asyncio
 import logging
 from typing import Any
 from asyncio import Task, CancelledError, sleep
@@ -9,6 +11,7 @@ from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.util.dt import utcnow, as_local, utc_from_timestamp
 from pyadtpulse.exceptions import (
     PulseLoginException,
+    PulseNotLoggedInError,
     PulseExceptionWithRetry,
     PulseExceptionWithBackoff,
 )
@@ -30,6 +33,23 @@ NEXT_REFRESH_CONTEXT = "NextRefresh"
 RECONNECT_DELAYS = (60, 300, 900, 1800)  # seconds, last one repeats
 LOGIN_RETRIES_BEFORE_REAUTH = 3
 
+# Session health guard (0.7.6). pyadtpulse's wait_for_update() only returns when
+# data changes or its sync task reports an error, so a session that dies quietly
+# (authenticated flag cleared, background task gone) blocks it forever and the
+# status sensor kept saying "Connection OK" (seen 2026-10-14..25). The update
+# loop now wakes every HEALTH_CHECK_INTERVAL seconds to look at the session.
+HEALTH_CHECK_INTERVAL = 60  # seconds
+# relogins clear the authenticated flag for a few seconds; only report a
+# problem that has lasted this long
+UNHEALTHY_GRACE = 180  # seconds
+# the keepalive task relogs in every 0.75-1.0 x relogin_interval; no relogin for
+# 2 x relogin_interval (+1 keepalive tick) means at least one cycle was missed
+STALE_RELOGIN_FACTOR = 2
+
+
+class ADTPulseSessionStaleError(Exception):
+    """The Pulse session stopped refreshing (no relogin or a dead task)."""
+
 
 class ADTPulseDataUpdateCoordinator(DataUpdateCoordinator):
     """Update Coordinator for ADT Pulse entities."""
@@ -45,6 +65,9 @@ class ADTPulseDataUpdateCoordinator(DataUpdateCoordinator):
         logger.debug("%s: creating update coordinator", ADTPULSE_DOMAIN)
         self._adt_pulse = pulse_service
         self._update_task: Task | None = None
+        self._wait_task: Task | None = None
+        self._unhealthy_since: float | None = None
+        self._health_exception: Exception | None = None
         super().__init__(
             hass,
             logger,
@@ -137,6 +160,82 @@ class ADTPulseDataUpdateCoordinator(DataUpdateCoordinator):
                 # a crashed update task must not make the entry fail to unload
                 logger.exception("%s: update task had failed", ADTPULSE_DOMAIN)
             self._update_task = None
+        self._cancel_wait_task()
+
+    def _cancel_wait_task(self) -> None:
+        if self._wait_task is not None and not self._wait_task.done():
+            self._wait_task.cancel()
+        self._wait_task = None
+
+    def _session_problem(self, now: float) -> Exception | None:
+        """Return an exception describing a dead/stale session, or None."""
+        pulse = self._adt_pulse
+        try:
+            if not pulse.is_connected:
+                return PulseNotLoggedInError()
+            # pyadtpulse internals (1.2.x); guarded so a library change only
+            # disables the extra checks instead of breaking updates
+            keepalive_task = getattr(pulse, "_timeout_task", None)
+            if keepalive_task is None or keepalive_task.done():
+                return ADTPulseSessionStaleError("keepalive task not running")
+            sync_task = getattr(pulse, "_sync_task", None)
+            if sync_task is not None and sync_task.done():
+                return ADTPulseSessionStaleError("sync check task not running")
+            relogin = pulse.relogin_interval * 60
+            auth = getattr(pulse, "_authentication_properties", None)
+            last_login = auth.last_login_time if auth is not None else 0
+            if relogin and last_login:
+                limit = STALE_RELOGIN_FACTOR * relogin + pulse.keepalive_interval * 60
+                if now - last_login > limit:
+                    return ADTPulseSessionStaleError(
+                        f"no relogin for {int((now - last_login) / 60)} minutes"
+                    )
+        except Exception as ex:  # noqa: BLE001
+            logger.debug("%s: session health check failed: %s", ADTPULSE_DOMAIN, ex)
+        return None
+
+    @callback
+    def _check_session_health(self, now: float | None = None) -> None:
+        """Flag a dead/stale session on the status sensor; clear it on recovery."""
+        now = time.time() if now is None else now
+        problem = self._session_problem(now)
+        if problem is None:
+            self._unhealthy_since = None
+            if (
+                self._health_exception is not None
+                and self.last_exception is self._health_exception
+            ):
+                logger.warning("%s: Pulse session healthy again", ADTPULSE_DOMAIN)
+                self._health_exception = None
+                self.last_exception = None
+                self.last_update_success = True
+                self.data = None
+                self.async_update_listeners()
+            self._health_exception = None
+            return
+        if self._unhealthy_since is None:
+            self._unhealthy_since = now
+        if now - self._unhealthy_since < UNHEALTHY_GRACE:
+            return
+        # don't hide a more specific error reported by pyadtpulse itself
+        if self.last_exception is not None and (
+            self.last_exception is not self._health_exception
+        ):
+            return
+        if self._health_exception is not None and type(problem) is type(
+            self._health_exception
+        ):
+            return
+        logger.warning(
+            "%s: Pulse session unhealthy (%s: %s)",
+            ADTPULSE_DOMAIN,
+            type(problem).__name__,
+            problem,
+        )
+        self._health_exception = problem
+        self.async_set_update_error(problem)
+        self.data = None
+        self.async_update_listeners()
 
     def _failure_count(self) -> int:
         return self.hass.data.setdefault(ADTPULSE_DOMAIN + "_reconnect", {}).get(
@@ -169,14 +268,26 @@ class ADTPulseDataUpdateCoordinator(DataUpdateCoordinator):
         if self.config_entry and not self.hass.is_stopping:
             self.hass.config_entries.async_schedule_reload(self.config_entry.entry_id)
 
-    async def _async_update_data(self) -> None:
+    async def _async_update_data(self) -> None:  # noqa: PLR0912, PLR0915
         """Fetch data from ADT Pulse."""
         while not self._shutdown_requested and not self.hass.is_stopping:
             data = None
             logger.debug("%s: coordinator waiting for updates", ADTPULSE_DOMAIN)
             update_exception: Exception | None = None
             try:
-                data = await self._adt_pulse.wait_for_update()
+                if self._wait_task is None:
+                    self._wait_task = asyncio.ensure_future(
+                        self._adt_pulse.wait_for_update()
+                    )
+                done, _ = await asyncio.wait(
+                    {self._wait_task}, timeout=HEALTH_CHECK_INTERVAL
+                )
+                if not done:
+                    # nothing from Pulse yet: check the session is still alive
+                    self._check_session_health()
+                    continue
+                wait_task, self._wait_task = self._wait_task, None
+                data = wait_task.result()
             except PulseLoginException as ex:
                 logger.error(
                     "%s: ADT Pulse login failed during coordinator update: %s",
@@ -207,6 +318,7 @@ class ADTPulseDataUpdateCoordinator(DataUpdateCoordinator):
                 )
             except CancelledError:
                 logger.debug("%s: coordinator received cancellation", ADTPULSE_DOMAIN)
+                self._cancel_wait_task()
                 return
             except Exception as ex:
                 logger.exception(
@@ -219,6 +331,7 @@ class ADTPulseDataUpdateCoordinator(DataUpdateCoordinator):
                 # silently end the update loop, so contain them
                 try:
                     if update_exception:
+                        self._health_exception = None
                         self.async_set_update_error(update_exception)
                         # async_set_update_error will only notify listeners on first
                         # error; it also doesn't reset data
@@ -226,6 +339,8 @@ class ADTPulseDataUpdateCoordinator(DataUpdateCoordinator):
                         if not self.last_update_success:
                             self.async_update_listeners()
                     elif data is not None:
+                        self._health_exception = None
+                        self._unhealthy_since = None
                         self.last_exception = None
                         self._set_failure_count(0)
                         self.async_set_updated_data(data)
