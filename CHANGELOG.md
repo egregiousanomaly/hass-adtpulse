@@ -1,3 +1,8 @@
+## 0.7.7 (2026-10-26)
+
+* An arm/disarm command that raises (e.g. pyadtpulse `PulseNotLoggedInError`, gateway offline, connection error) no longer escapes raw. The optimistic arming/disarming state is cleared, `adtpulse_command_failed` fires (attempts 1) and a `HomeAssistantError("Could not <action>: <reason>")` is raised, so `continue_on_error: true` in scripts/automations applies. Covers disarm, arm stay/away/night and the force_stay/force_away services. No automatic retry; the connection watchdog handles reconnecting.
+* `adtpulse_command_failed` event data gains a short `reason` (e.g. "not logged in to Pulse", "Pulse gateway offline", "cannot reach Pulse", the exception class name, "Pulse portal did not accept it", or "panel communication failure" for the confirm timeout). Existing fields (`entity_id`, `action`, `attempts`, `last_status`, `message`) are unchanged.
+
 ## 0.7.6 (2026-10-26)
 
 * Detect a dead or stale Pulse session. pyadtpulse's `wait_for_update()` only returns on data changes or errors, so a session that was silently logged out (2026-10-14..25) left the connection-status sensor at "Connection OK" for days. The update loop now wakes every 60 s and checks the session:

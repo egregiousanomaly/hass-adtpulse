@@ -9,6 +9,11 @@ from collections.abc import Callable, Coroutine
 from pyadtpulse.site import ADTPulseSite
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.util.dt import as_local
+from pyadtpulse.exceptions import (
+    PulseConnectionError,
+    PulseNotLoggedInError,
+    PulseGatewayOfflineError,
+)
 from pyadtpulse.alarm_panel import (
     ADT_ALARM_OFF,
     ADT_ALARM_AWAY,
@@ -73,6 +78,17 @@ FORCE_ARM = "force arm"
 ARM_ERROR_MESSAGE = (
     f"Pulse system cannot be armed due to opened/tripped zone - use {FORCE_ARM}"
 )
+
+
+def _failure_reason(ex: BaseException) -> str:
+    """Short, human readable reason a command could not be sent."""
+    if isinstance(ex, PulseNotLoggedInError):
+        return "not logged in to Pulse"
+    if isinstance(ex, PulseGatewayOfflineError):
+        return "Pulse gateway offline"
+    if isinstance(ex, PulseConnectionError):
+        return "cannot reach Pulse"
+    return type(ex).__name__
 
 
 async def async_setup_entry(
@@ -230,10 +246,28 @@ class ADTPulseAlarm(ADTPulseEntity, AlarmControlPanelEntity):
             return
         self._cancel_confirm_task()
         name = self._action_name(action, force_arm)
-        result = await self._send_alarm_command(coro, action)
+        try:
+            result = await self._send_alarm_command(coro, action)
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:
+            # _send_alarm_command already cleared the optimistic arming state;
+            # report it like any other failed command and raise an HA error so
+            # continue_on_error in scripts/automations applies
+            reason = _failure_reason(ex)
+            logger.warning(
+                "%s: could not %s ADT Pulse alarm: %s (%s)",
+                ADTPULSE_DOMAIN,
+                name,
+                reason,
+                ex,
+            )
+            self._clear_assumed_state()
+            self._fire_command_failed(name, 1, reason)
+            raise HomeAssistantError(f"Could not {name}: {reason}") from ex
         if not result:
             logger.warning("Could not %s ADT Pulse alarm", action)
-            self._fire_command_failed(name, 1)
+            self._fire_command_failed(name, 1, "Pulse portal did not accept it")
             raise HomeAssistantError(f"Could not set alarm status to {action}")
         self._confirm_target = self._confirm_state_for(action)
         self._confirm_event.clear()
@@ -343,12 +377,10 @@ class ADTPulseAlarm(ADTPulseEntity, AlarmControlPanelEntity):
                 )
                 try:
                     result = await self._send_alarm_command(arm_disarm_func(), action)
-                except Exception:  # noqa: BLE001
+                except Exception:
                     logger.exception("%s: retry of %s failed", ADTPULSE_DOMAIN, name)
                     result = False
-                if result and await self._wait_for_confirmation(
-                    ALARM_CONFIRM_TIMEOUT
-                ):
+                if result and await self._wait_for_confirmation(ALARM_CONFIRM_TIMEOUT):
                     logger.info(
                         "%s: panel confirmed %s after retry", ADTPULSE_DOMAIN, name
                     )
@@ -371,9 +403,16 @@ class ADTPulseAlarm(ADTPulseEntity, AlarmControlPanelEntity):
                 self._confirm_target = None
 
     @callback
-    def _fire_command_failed(self, name: str, attempts: int) -> None:
+    def _fire_command_failed(
+        self, name: str, attempts: int, reason: str | None = None
+    ) -> None:
         if self.hass is None:
             return
+        if reason is None:
+            reason = "panel communication failure"
+            message = f"ADT Pulse did not confirm {name} ({reason})"
+        else:
+            message = f"ADT Pulse could not {name} ({reason})"
         self.hass.bus.async_fire(
             EVENT_COMMAND_FAILED,
             {
@@ -381,10 +420,8 @@ class ADTPulseAlarm(ADTPulseEntity, AlarmControlPanelEntity):
                 "action": name,
                 "attempts": attempts,
                 "last_status": self._real_alarm_state(),
-                "message": (
-                    f"ADT Pulse did not confirm {name} "
-                    "(panel communication failure)"
-                ),
+                "reason": reason,
+                "message": message,
             },
         )
 
@@ -525,8 +562,9 @@ class ADTPulseAlarm(ADTPulseEntity, AlarmControlPanelEntity):
             self._site.id,
         )
         if self._assumed_state is not None and self._real_state_satisfies_request():
-            logger.debug("%s: real alarm status reached, clearing assumed state",
-                         ADTPULSE_DOMAIN)
+            logger.debug(
+                "%s: real alarm status reached, clearing assumed state", ADTPULSE_DOMAIN
+            )
             self._assumed_state = None
             self._requested_action = None
         if self._confirm_target_reached():
