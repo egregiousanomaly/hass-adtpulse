@@ -40,6 +40,16 @@ from .coordinator import (
 
 logger = logging.getLogger(__name__)
 
+
+def _local_time_or_none(timestamp: float | None) -> datetime | None:
+    """Convert a pyadtpulse epoch timestamp; None/0/invalid -> None."""
+    if not timestamp:
+        return None
+    try:
+        return as_local(datetime.fromtimestamp(timestamp))
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
 # please keep these alphabetized to make changes easier
 ADT_DEVICE_CLASS_TAG_MAP = {
     "co": BinarySensorDeviceClass.CO,
@@ -324,8 +334,9 @@ class ADTPulseGatewaySensor(ADTPulseEntity, BinarySensorEntity):
                 self._gateway.backoff.get_current_backoff_interval()
             ),
             "initial_poll_interval": self._gateway.backoff.initial_backoff_interval,
-            "next_update": as_local(datetime.fromtimestamp(self._gateway.next_update)),
-            "last_update": as_local(datetime.fromtimestamp(self._gateway.last_update)),
+            # pyadtpulse can report None for these after a failed gateway fetch
+            "next_update": _local_time_or_none(self._gateway.next_update),
+            "last_update": _local_time_or_none(self._gateway.last_update),
         }
 
     @property

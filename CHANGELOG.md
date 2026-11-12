@@ -1,3 +1,13 @@
+## 0.7.8 (2026-11-12)
+
+Self-heal after a silent Pulse cloud logout (incident 2026-11-11 03:43-04:05 PST: entry stuck in FAILED_UNLOAD, all ADT entities unavailable until an HA restart).
+
+* Root cause: after the portal signed the session out, pyadtpulse 1.2.14 parsed the gateway page into `next_update = None`; its keepalive task then crashed on `next_update < time.time()` (`pyadtpulse_async.py:270`). pyadtpulse re-awaits that dead task in `async_login()`/`async_logout()`, so its own relogin and our unload both re-raised the TypeError.
+* Workaround at the source: `ADTPulseGateway.set_gateway_attributes` is wrapped (once, idempotent) so a None `next_update`/`last_update` becomes 0, the dataclass default ("refresh on next keepalive"). Old behaviour: stored None.
+* `async_unload_entry`: coordinator stop and Pulse logout are each wrapped in try/except with a 30 s timeout, dead pyadtpulse tasks are discarded first, and failures are logged as warnings. The result is now the platform-unload result only; a failed logout can no longer cause FAILED_UNLOAD. Old behaviour: `await coordinator.stop(); await coordinator.adtpulse.async_logout()` unguarded, and only when platforms unloaded.
+* In-integration relogin: when the session health check (0.7.6) has flagged "Not Logged In" / "Connection Stale", the update loop drops dead pyadtpulse tasks, resets the dead session and calls `async_login()` (starts a fresh keepalive task; the sync-check task is recreated by the next `wait_for_update()`). At most one attempt every 5 min, run from the existing 60 s health check (no new task or timer). If it keeps failing, the connection-watchdog automation's entry reload is the fallback and can now always unload. Old behaviour: no relogin; pyadtpulse skips relogin while not connected.
+* Gateway binary sensor: `next_update`/`last_update` attributes are None instead of raising TypeError when pyadtpulse reports None/0.
+
 ## 0.7.7 (2026-10-26)
 
 * An arm/disarm command that raises (e.g. pyadtpulse `PulseNotLoggedInError`, gateway offline, connection error) no longer escapes raw. The optimistic arming/disarming state is cleared, `adtpulse_command_failed` fires (attempts 1) and a `HomeAssistantError("Could not <action>: <reason>")` is raised, so `continue_on_error: true` in scripts/automations applies. Covers disarm, arm stay/away/night and the force_stay/force_away services. No automatic retry; the connection watchdog handles reconnecting.

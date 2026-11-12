@@ -20,6 +20,7 @@ from pyadtpulse.pyadtpulse_async import PyADTPulseAsync
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import ADTPULSE_DOMAIN
+from .utils import discard_dead_pulse_tasks
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,14 @@ UNHEALTHY_GRACE = 180  # seconds
 # the keepalive task relogs in every 0.75-1.0 x relogin_interval; no relogin for
 # 2 x relogin_interval (+1 keepalive tick) means at least one cycle was missed
 STALE_RELOGIN_FACTOR = 2
+# Self-heal (0.7.8): once the session has been flagged unhealthy (after
+# UNHEALTHY_GRACE), the update loop tries one in-place relogin, at most every
+# SELF_HEAL_INTERVAL seconds while it stays unhealthy. No extra task or timer:
+# it runs from the existing 60 s health check. If relogin keeps failing, the
+# connection watchdog automation's entry reload (which can now always unload)
+# is the fallback.
+SELF_HEAL_INTERVAL = 300  # seconds
+SELF_HEAL_TIMEOUT = 90  # seconds
 
 
 class ADTPulseSessionStaleError(Exception):
@@ -68,6 +77,7 @@ class ADTPulseDataUpdateCoordinator(DataUpdateCoordinator):
         self._wait_task: Task | None = None
         self._unhealthy_since: float | None = None
         self._health_exception: Exception | None = None
+        self._last_self_heal: float = 0.0
         super().__init__(
             hass,
             logger,
@@ -237,6 +247,53 @@ class ADTPulseDataUpdateCoordinator(DataUpdateCoordinator):
         self.data = None
         self.async_update_listeners()
 
+    def _should_self_heal(self, now: float) -> bool:
+        return (
+            self._health_exception is not None
+            and self.last_exception is self._health_exception
+            and now - self._last_self_heal >= SELF_HEAL_INTERVAL
+        )
+
+    async def _async_self_heal(self) -> None:
+        """Relogin in place after a silent logout / dead keepalive task.
+
+        pyadtpulse does not relogin by itself when the portal signs the session
+        out (its keepalive skips relogin while not connected), and a keepalive
+        task that crashed is re-raised by every later async_login(). Drop the
+        dead tasks, log in again (this starts a fresh keepalive task) and restart
+        wait_for_update() so it creates a fresh sync-check task.
+        """
+        self._last_self_heal = time.time()
+        pulse = self._adt_pulse
+        logger.warning(
+            "%s: session unhealthy (%s); trying to log in to Pulse again",
+            ADTPULSE_DOMAIN,
+            self._health_exception,
+        )
+        # the pending wait is tied to the old sync task; start a new one after
+        self._cancel_wait_task()
+        try:
+            discard_dead_pulse_tasks(pulse)
+            if not pulse.is_connected:
+                # make pyadtpulse forget the dead session before logging in
+                await pulse._pulse_connection.quick_logout()  # noqa: SLF001
+            async with asyncio.timeout(SELF_HEAL_TIMEOUT):
+                await pulse.async_login()
+        except CancelledError:
+            raise
+        except Exception as ex:  # noqa: BLE001
+            logger.warning(
+                "%s: Pulse relogin failed (%r); will retry in %d s, the connection "
+                "watchdog reloads the entry if it stays down",
+                ADTPULSE_DOMAIN,
+                ex,
+                SELF_HEAL_INTERVAL,
+            )
+            return
+        logger.warning("%s: Pulse relogin succeeded", ADTPULSE_DOMAIN)
+        # health check clears the status on its next pass once all is well
+        self._check_session_health()
+
     def _failure_count(self) -> int:
         return self.hass.data.setdefault(ADTPULSE_DOMAIN + "_reconnect", {}).get(
             self.config_entry.entry_id if self.config_entry else "", 0
@@ -285,6 +342,8 @@ class ADTPulseDataUpdateCoordinator(DataUpdateCoordinator):
                 if not done:
                     # nothing from Pulse yet: check the session is still alive
                     self._check_session_health()
+                    if self._should_self_heal(time.time()):
+                        await self._async_self_heal()
                     continue
                 wait_task, self._wait_task = self._wait_task, None
                 data = wait_task.result()

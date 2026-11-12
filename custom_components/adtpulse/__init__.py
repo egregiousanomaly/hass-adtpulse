@@ -3,6 +3,7 @@
 See https://github.com/EVWorth/hass-adtpulse
 """
 
+import asyncio
 import logging
 from typing import Any
 from asyncio import gather
@@ -42,10 +43,17 @@ from .const import (
     CONF_RELOGIN_INTERVAL,
     CONF_KEEPALIVE_INTERVAL,
 )
-from .utils import get_gateway_unique_id
+from .utils import (
+    get_gateway_unique_id,
+    discard_dead_pulse_tasks,
+    install_pyadtpulse_workarounds,
+)
 from .coordinator import ADTPulseDataUpdateCoordinator
 
 logger = logging.getLogger(__name__)
+
+# a failed/hung logout must never wedge the entry in FAILED_UNLOAD
+UNLOAD_STEP_TIMEOUT = 30  # seconds
 
 SUPPORTED_PLATFORMS = [
     "alarm_control_panel",
@@ -87,6 +95,7 @@ async def async_step_import(self, import_config: dict[str, Any]) -> FlowResult:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Initialize the ADTPulse integration."""
+    install_pyadtpulse_workarounds()
     username = entry.data.get(CONF_USERNAME)
     password = entry.data.get(CONF_PASSWORD)
     fingerprint = entry.data.get(CONF_FINGERPRINT)
@@ -227,12 +236,30 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
     )
 
-    if unload_ok:
-        coordinator: ADTPulseDataUpdateCoordinator = hass.data[ADTPULSE_DOMAIN][
-            entry.entry_id
-        ]
-        await coordinator.stop()
-        await coordinator.adtpulse.async_logout()
-        hass.data[ADTPULSE_DOMAIN].pop(entry.entry_id)
+    # Always clean up, and never let a failing stop/logout turn into an unload
+    # failure: HA marks the entry FAILED_UNLOAD and no reload can recover it
+    # (2026-11-11, pyadtpulse re-raising a dead keepalive task's TypeError).
+    coordinator = hass.data.get(ADTPULSE_DOMAIN, {}).pop(entry.entry_id, None)
+    if isinstance(coordinator, ADTPulseDataUpdateCoordinator):
+        try:
+            async with asyncio.timeout(UNLOAD_STEP_TIMEOUT):
+                await coordinator.stop()
+        except Exception as ex:  # noqa: BLE001
+            logger.warning(
+                "%s: error stopping update coordinator during unload (ignored): %r",
+                ADTPULSE_DOMAIN,
+                ex,
+            )
+        pulse = coordinator.adtpulse
+        try:
+            discard_dead_pulse_tasks(pulse)
+            async with asyncio.timeout(UNLOAD_STEP_TIMEOUT):
+                await pulse.async_logout()
+        except Exception as ex:  # noqa: BLE001
+            logger.warning(
+                "%s: Pulse logout failed during unload (ignored): %r",
+                ADTPULSE_DOMAIN,
+                ex,
+            )
 
     return unload_ok
