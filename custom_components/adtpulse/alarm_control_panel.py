@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from typing import NoReturn
 from datetime import datetime
 from functools import partial
 from collections.abc import Callable, Coroutine
@@ -73,6 +74,9 @@ _ARMED_STATES = {
 ALARM_CONFIRM_TIMEOUT = 120  # seconds
 ALARM_COMMAND_ATTEMPTS = 2  # first try + one retry
 EVENT_COMMAND_FAILED = "adtpulse_command_failed"
+# 0.7.9: a command refused because Pulse silently logged us out gets one
+# in-place relogin + one re-send, bounded by this total time
+COMMAND_RELOGIN_TIMEOUT = 20  # seconds
 
 FORCE_ARM = "force arm"
 ARM_ERROR_MESSAGE = (
@@ -88,6 +92,8 @@ def _failure_reason(ex: BaseException) -> str:
         return "Pulse gateway offline"
     if isinstance(ex, PulseConnectionError):
         return "cannot reach Pulse"
+    if isinstance(ex, TimeoutError):
+        return "timed out logging in to Pulse again"
     return type(ex).__name__
 
 
@@ -246,28 +252,32 @@ class ADTPulseAlarm(ADTPulseEntity, AlarmControlPanelEntity):
             return
         self._cancel_confirm_task()
         name = self._action_name(action, force_arm)
+        attempts = 1
         try:
             result = await self._send_alarm_command(coro, action)
         except asyncio.CancelledError:
             raise
         except Exception as ex:
-            # _send_alarm_command already cleared the optimistic arming state;
-            # report it like any other failed command and raise an HA error so
-            # continue_on_error in scripts/automations applies
-            reason = _failure_reason(ex)
+            if not isinstance(ex, PulseNotLoggedInError):
+                self._report_send_failure(name, 1, ex)
+            # Pulse logged us out without saying so: log in again and re-send
+            # the same command once (fresh coroutine from the factory)
             logger.warning(
-                "%s: could not %s ADT Pulse alarm: %s (%s)",
+                "%s: could not %s ADT Pulse alarm (not logged in); "
+                "logging in again and retrying once",
                 ADTPULSE_DOMAIN,
                 name,
-                reason,
-                ex,
             )
-            self._clear_assumed_state()
-            self._fire_command_failed(name, 1, reason)
-            raise HomeAssistantError(f"Could not {name}: {reason}") from ex
+            attempts = 2
+            try:
+                result = await self._relogin_and_resend(arm_disarm_func, action)
+            except asyncio.CancelledError:
+                raise
+            except Exception as ex2:  # noqa: BLE001
+                self._report_send_failure(name, 2, ex2)
         if not result:
             logger.warning("Could not %s ADT Pulse alarm", action)
-            self._fire_command_failed(name, 1, "Pulse portal did not accept it")
+            self._fire_command_failed(name, attempts, "Pulse portal did not accept it")
             raise HomeAssistantError(f"Could not set alarm status to {action}")
         self._confirm_target = self._confirm_state_for(action)
         self._confirm_event.clear()
@@ -283,6 +293,36 @@ class ADTPulseAlarm(ADTPulseEntity, AlarmControlPanelEntity):
             self._confirm_task = self.hass.async_create_background_task(
                 target, task_name
             )
+
+    def _report_send_failure(
+        self, name: str, attempts: int, ex: BaseException
+    ) -> NoReturn:
+        """Command could not be sent: clear state, fire the event, raise.
+
+        _send_alarm_command already cleared the optimistic arming state; raise
+        an HA error so continue_on_error in scripts/automations applies.
+        """
+        reason = _failure_reason(ex)
+        logger.warning(
+            "%s: could not %s ADT Pulse alarm: %s (%r)",
+            ADTPULSE_DOMAIN,
+            name,
+            reason,
+            ex,
+        )
+        self._clear_assumed_state()
+        self._fire_command_failed(name, attempts, reason)
+        raise HomeAssistantError(f"Could not {name}: {reason}") from ex
+
+    async def _relogin_and_resend(
+        self,
+        arm_disarm_func: Callable[[], Coroutine[bool | None, None, bool]],
+        action: AlarmControlPanelState,
+    ) -> bool:
+        """Relogin in place, then send the command one more time."""
+        async with asyncio.timeout(COMMAND_RELOGIN_TIMEOUT):
+            await self.coordinator.async_relogin_for_command()
+            return await self._send_alarm_command(arm_disarm_func(), action)
 
     async def _send_alarm_command(
         self,

@@ -54,6 +54,11 @@ STALE_RELOGIN_FACTOR = 2
 # is the fallback.
 SELF_HEAL_INTERVAL = 300  # seconds
 SELF_HEAL_TIMEOUT = 90  # seconds
+# Command relogin (0.7.9): when an arm/disarm is refused because Pulse logged
+# us out without telling us, the alarm entity calls async_relogin_for_command()
+# and re-sends the command once. The wait_for_update() task is tied to the old
+# sync task, so the update loop restarts it on its next pass instead of the
+# entity cancelling it under the loop's feet.
 
 
 class ADTPulseSessionStaleError(Exception):
@@ -78,6 +83,8 @@ class ADTPulseDataUpdateCoordinator(DataUpdateCoordinator):
         self._unhealthy_since: float | None = None
         self._health_exception: Exception | None = None
         self._last_self_heal: float = 0.0
+        self._relogin_lock = asyncio.Lock()
+        self._restart_wait_pending = False
         super().__init__(
             hass,
             logger,
@@ -273,12 +280,8 @@ class ADTPulseDataUpdateCoordinator(DataUpdateCoordinator):
         # the pending wait is tied to the old sync task; start a new one after
         self._cancel_wait_task()
         try:
-            discard_dead_pulse_tasks(pulse)
-            if not pulse.is_connected:
-                # make pyadtpulse forget the dead session before logging in
-                await pulse._pulse_connection.quick_logout()  # noqa: SLF001
             async with asyncio.timeout(SELF_HEAL_TIMEOUT):
-                await pulse.async_login()
+                await self._relogin_in_place()
         except CancelledError:
             raise
         except Exception as ex:  # noqa: BLE001
@@ -293,6 +296,30 @@ class ADTPulseDataUpdateCoordinator(DataUpdateCoordinator):
         logger.warning("%s: Pulse relogin succeeded", ADTPULSE_DOMAIN)
         # health check clears the status on its next pass once all is well
         self._check_session_health()
+
+    async def _relogin_in_place(self) -> None:
+        """Drop dead pyadtpulse tasks and log in again (shared by self-heal and
+        command relogin; serialized so two relogins never overlap)."""
+        pulse = self._adt_pulse
+        async with self._relogin_lock:
+            discard_dead_pulse_tasks(pulse)
+            if not pulse.is_connected:
+                # make pyadtpulse forget the dead session before logging in
+                await pulse._pulse_connection.quick_logout()  # noqa: SLF001
+            await pulse.async_login()
+
+    async def async_relogin_for_command(self) -> None:
+        """Log in to Pulse again right now because a command was refused as
+        not logged in. Raises whatever the login raises; the caller bounds the
+        time. The update loop restarts its wait task on its next pass."""
+        logger.warning(
+            "%s: alarm command refused (not logged in); logging in to Pulse again",
+            ADTPULSE_DOMAIN,
+        )
+        self._last_self_heal = time.time()
+        await self._relogin_in_place()
+        self._restart_wait_pending = True
+        logger.warning("%s: Pulse relogin for command succeeded", ADTPULSE_DOMAIN)
 
     def _failure_count(self) -> int:
         return self.hass.data.setdefault(ADTPULSE_DOMAIN + "_reconnect", {}).get(
@@ -340,6 +367,11 @@ class ADTPulseDataUpdateCoordinator(DataUpdateCoordinator):
                     {self._wait_task}, timeout=HEALTH_CHECK_INTERVAL
                 )
                 if not done:
+                    if self._restart_wait_pending:
+                        # a command relogged in; the old wait belongs to the
+                        # previous session's sync task
+                        self._restart_wait_pending = False
+                        self._cancel_wait_task()
                     # nothing from Pulse yet: check the session is still alive
                     self._check_session_health()
                     if self._should_self_heal(time.time()):

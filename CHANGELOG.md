@@ -1,3 +1,15 @@
+## 0.7.9 (2026-11-24)
+
+- Arm/disarm refused with `PulseNotLoggedInError` (Pulse ended the session without the
+  library noticing) now logs in again in place and re-sends the same command once,
+  bounded to 20 s in total. Only if that also fails does the entity clear its
+  arming state, fire `adtpulse_command_failed` (`attempts: 2`) and raise
+  `HomeAssistantError`. Other errors are not retried.
+- Coordinator: `async_relogin_for_command()`; relogin shared with the 0.7.8 self-heal
+  and serialized by a lock; the update loop restarts its wait task after a command
+  relogin.
+- tests/test_command_relogin.py (mocked pyadtpulse).
+
 ## 0.7.8 (2026-11-12)
 
 Self-heal after a silent Pulse cloud logout (incident 2026-11-11 03:43-04:05 PST: entry stuck in FAILED_UNLOAD, all ADT entities unavailable until an HA restart).
